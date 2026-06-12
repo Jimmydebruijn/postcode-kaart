@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import requests
 import pandas as pd
@@ -5,24 +6,16 @@ import folium
 from folium.features import GeoJsonTooltip
 from streamlit_folium import st_folium
 import plotly.express as px
-import json
 
-st.set_page_config(
-    page_title="Nederland Demografische Kaart",
-    page_icon="🗺️",
-    layout="wide"
-)
-
+st.set_page_config(page_title="Nederland Demografische Kaart", page_icon="🗺️", layout="wide")
 st.title("🗺️ Nederland Demografische Kaart")
-st.caption("Klik op een gemeente voor details • Zoom in voor postcodegebieden • Bron: CBS StatLine (CC BY 4.0)")
+st.caption("Klik op een gemeente voor details • Bron: CBS StatLine (CC BY 4.0)")
 
-# ── Constanten ─────────────────────────────────────────────────────────────────
-BASE     = "https://opendata.cbs.nl/ODataApi/OData/83502NED"
-HH_BASE  = "https://opendata.cbs.nl/ODataApi/OData/83505NED"
-HK_BASE  = "https://opendata.cbs.nl/ODataApi/OData/85640NED"
+BASE    = "https://opendata.cbs.nl/ODataApi/OData/83502NED"
+HH_BASE = "https://opendata.cbs.nl/ODataApi/OData/83505NED"
+HK_BASE = "https://opendata.cbs.nl/ODataApi/OData/85640NED"
 
 GEOJSON_GEMEENTE = "https://cartomap.github.io/nl/wgs84/gemeente_2024.geojson"
-GEOJSON_PC4      = "https://cartomap.github.io/nl/wgs84/postcode4_2024.geojson"
 
 LABEL_MAP = {
     "0 tot 5 jaar":"0-5","5 tot 10 jaar":"5-10","10 tot 15 jaar":"10-15",
@@ -47,14 +40,18 @@ HK_GEWENST = {
     "Afrika":"Afrika","Amerika":"Amerika","Azië":"Azië",
     "Turkije":"Turkije","Marokko":"Marokko","Suriname":"Suriname",
 }
-HK_CAT_ORDER = ["Nederland","Europa (excl. NL)","Turkije","Marokko","Suriname","Afrika","Amerika","Azië"]
+HK_CAT  = ["Nederland","Europa (excl. NL)","Turkije","Marokko","Suriname","Afrika","Amerika","Azië"]
 HH_TYPEN = {
     "Eenpersoonshuishouden":"Alleenstaand",
     "Meerpersoonshuishouden met kinderen":"Gezin met kinderen",
     "Meerpersoonshuishouden zonder kinderen":"Stel/meerp. zonder kinderen",
 }
 
-# ── CBS fetch ──────────────────────────────────────────────────────────────────
+# ── Session state ──────────────────────────────────────────────────────────────
+if "geselecteerde_gemeente" not in st.session_state:
+    st.session_state.geselecteerde_gemeente = None
+
+# ── Fetch helpers ──────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def fetch(url):
     rows, nxt = [], url
@@ -66,13 +63,13 @@ def fetch(url):
         nxt = d.get("odata.nextLink")
     return rows
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=7200, show_spinner="GeoJSON laden...")
 def get_geojson(url):
     r = requests.get(url, timeout=30)
     r.raise_for_status()
     return r.json()
 
-# ── Leeftijd meta ──────────────────────────────────────────────────────────────
+# ── CBS leeftijd per postcode ──────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def get_leeftijd_meta():
     perioden      = fetch(f"{BASE}/Perioden?$format=json")
@@ -103,36 +100,55 @@ def get_leeftijd_verd(pc_key, periode_key, geslacht_key, leeftijd_keys, leeftijd
                 out[label] = out.get(label,0) + (row.get("Bevolking_1") or 0)
     return out
 
-# ── Gemeente-niveau leeftijdsdata (CBS kerncijfers per gemeente) ───────────────
-@st.cache_data(ttl=7200, show_spinner="Gemeentedata laden (eenmalig)...")
-def get_gemeente_leeftijd():
+# ── CBS kerncijfers per gemeente (85984NED) voor choropleth ───────────────────
+@st.cache_data(ttl=7200, show_spinner="Gemeentedata laden (eenmalig ~30s)...")
+def get_gemeente_kerncijfers():
     """
-    Haal gemiddelde leeftijd per gemeente op via CBS tabel 85318NED
-    (Kerncijfers wijken en buurten) — bevat GemiddeldeLeeftijd direct.
+    Haal gemiddelde leeftijd per gemeente via CBS 85984NED.
+    Codering = 'GM' + gemeentecode (4-cijferig, bijv. GM0363).
     """
     try:
-        # Probeer CBS Wijk- en buurtkaart tabel voor gemiddelde leeftijd per gemeente
-        r = requests.get(
-            "https://opendata.cbs.nl/ODataApi/OData/85318NED/TypedDataSet"
-            "?$format=json&$filter=SoortRegio eq 'Gemeente'&$select=Codering,GemiddeldeLeeftijd_P1&$top=500",
-            timeout=30
+        # Haal DataProperties om juiste kolomnaam te vinden
+        props = fetch("https://opendata.cbs.nl/ODataApi/OData/85984NED/DataProperties?$format=json")
+        leeftijd_col = next(
+            (p["Key"] for p in props if "Leeftijd" in p.get("Title","") and "Gemiddeld" in p.get("Title","")),
+            None
         )
-        if r.status_code == 200:
-            data = r.json().get("value", [])
-            return {row["Codering"].strip(): row.get("GemiddeldeLeeftijd_P1") for row in data if row.get("GemiddeldeLeeftijd_P1")}
-    except Exception:
-        pass
-    return {}
+        if not leeftijd_col:
+            # Fallback: zoek op sleutelnaam
+            leeftijd_col = next(
+                (p["Key"] for p in props if "GemiddeldeLeeftijd" in p.get("Key","")),
+                None
+            )
 
-# ── Huishoudens data per postcode ──────────────────────────────────────────────
+        if not leeftijd_col:
+            return {}, None
+
+        # Haal alle gemeenten op (SoortRegio = 'Gemeente')
+        obs = fetch(
+            f"https://opendata.cbs.nl/ODataApi/OData/85984NED/TypedDataSet?$format=json"
+            f"&$filter=SoortRegio eq 'Gemeente'"
+            f"&$select=WijkenEnBuurten,{leeftijd_col}"
+        )
+        result = {}
+        for row in obs:
+            code = row.get("WijkenEnBuurten","").strip()  # bijv. "GM0363"
+            val  = row.get(leeftijd_col)
+            if code and val:
+                result[code] = round(float(val), 1)
+        return result, leeftijd_col
+    except Exception as e:
+        return {}, None
+
+# ── CBS huishoudens per postcode ───────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def get_hh_meta():
-    perioden  = fetch(f"{HH_BASE}/Perioden?$format=json")
-    per_key   = perioden[-1]["Key"]
-    hh_typen  = fetch(f"{HH_BASE}/Huishoudenssamenstelling?$format=json")
-    hh_map    = {h["Key"].strip(): h["Title"].strip() for h in hh_typen}
-    alle_pc   = fetch(f"{HH_BASE}/Postcode?$format=json")
-    pc_map    = {item["Title"].strip(): item["Key"] for item in alle_pc}
+    perioden = fetch(f"{HH_BASE}/Perioden?$format=json")
+    per_key  = perioden[-1]["Key"]
+    hh_typen = fetch(f"{HH_BASE}/Huishoudenssamenstelling?$format=json")
+    hh_map   = {h["Key"].strip(): h["Title"].strip() for h in hh_typen}
+    alle_pc  = fetch(f"{HH_BASE}/Postcode?$format=json")
+    pc_map   = {item["Title"].strip(): item["Key"] for item in alle_pc}
     return per_key, hh_map, pc_map
 
 @st.cache_data(ttl=3600)
@@ -152,7 +168,7 @@ def get_hh_data(pc_key, periode_key, hh_map):
             d["__grootte"] = row.get("GemiddeldeHuishoudensgrootte_2") or 0
     return d
 
-# ── Herkomst data per postcode ─────────────────────────────────────────────────
+# ── CBS herkomst per postcode ──────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def get_hk_meta():
     perioden   = fetch(f"{HK_BASE}/Perioden?$format=json")
@@ -182,15 +198,57 @@ def get_hk_data(pc_key, periode_key, gb_totaal, gsl_key, hk_map):
             result[HK_GEWENST[titel]] = row.get("Bevolking_1") or 0
     return result
 
-# ── Hulpfuncties ───────────────────────────────────────────────────────────────
+# ── PDOK helpers ───────────────────────────────────────────────────────────────
+@st.cache_data(ttl=3600)
+def gemeente_van_coordinaten(lat, lon):
+    """Reverse geocode: coördinaten → gemeentenaam via PDOK."""
+    try:
+        r = requests.get(
+            "https://api.pdok.nl/bzk/locatieserver/search/v3_1/reverse",
+            params={"lat": lat, "lon": lon, "type": "gemeente", "rows": 1},
+            timeout=6
+        )
+        if r.status_code == 200:
+            docs = r.json().get("response",{}).get("docs",[])
+            if docs:
+                return docs[0].get("weergavenaam","").replace("Gemeente ","")
+    except Exception:
+        pass
+    return None
+
+@st.cache_data(ttl=3600)
+def postcodes_van_gemeente(naam):
+    alle, start = [], 0
+    while True:
+        try:
+            r = requests.get(
+                "https://api.pdok.nl/bzk/locatieserver/search/v3_1/free",
+                params={"q": naam, "fq": "type:postcode",
+                        "fl": "weergavenaam,gemeentenaam", "rows": 100, "start": start},
+                timeout=10
+            )
+            if r.status_code != 200: break
+            data = r.json().get("response",{})
+            docs = data.get("docs",[])
+            if not docs: break
+            for d in docs:
+                if d.get("gemeentenaam","").lower() == naam.lower():
+                    m = re.search(r'\b(\d{4})[A-Z]{2}\b', d.get("weergavenaam",""))
+                    if m: alle.append(m.group(1))
+            if start + 100 >= data.get("numFound",0): break
+            start += 100
+        except Exception:
+            break
+    return sorted(set(alle))
+
+# ── Rekenhulpen ────────────────────────────────────────────────────────────────
 def pct(verd):
     tot = sum(verd.values())
     return {k: v/tot*100 for k,v in verd.items()} if tot else {}
 
-def gem_leeftijd_verd(verd):
+def gem_leeftijd_fn(verd):
     tot = sum(verd.values())
-    if not tot: return None
-    return sum(GEWICHTEN[k]*v for k,v in verd.items()) / tot
+    return sum(GEWICHTEN[k]*v for k,v in verd.items())/tot if tot else None
 
 def combineer(verds):
     out = {}
@@ -198,321 +256,269 @@ def combineer(verds):
         for k,a in v.items(): out[k] = out.get(k,0)+a
     return out
 
-# ── PDOK plaatsnaam → postcodelijst ────────────────────────────────────────────
-@st.cache_data(ttl=3600)
-def zoek_postcodes_van_gemeente(naam):
-    try:
-        r = requests.get(
-            "https://api.pdok.nl/bzk/locatieserver/search/v3_1/free",
-            params={"q": naam, "fq": "type:postcode", "fl": "weergavenaam,gemeentenaam",
-                    "rows": 100},
-            timeout=8
-        )
-        if r.status_code == 200:
-            docs = r.json().get("response",{}).get("docs",[])
-            import re
-            pcs = set()
-            for d in docs:
-                if d.get("gemeentenaam","").lower() == naam.lower():
-                    m = re.search(r'\b(\d{4})[A-Z]{2}\b', d.get("weergavenaam",""))
-                    if m: pcs.add(m.group(1))
-            return sorted(pcs)
-    except Exception:
-        pass
-    return []
-
-# ── Laden ──────────────────────────────────────────────────────────────────────
+# ── Data laden ─────────────────────────────────────────────────────────────────
 with st.spinner("Metadata laden..."):
     periode_key, periode_title, leeftijd_map, leeftijd_keys, geslacht_key, pc_key_map = get_leeftijd_meta()
     hh_per_key, hh_map_meta, hh_pc_map = get_hh_meta()
     hk_per_key, hk_map_meta, gb_totaal, gsl_key, hk_pc_map = get_hk_meta()
 
-with st.spinner("GeoJSON gemeentegrenzen laden..."):
-    try:
-        gemeente_geojson = get_geojson(GEOJSON_GEMEENTE)
-        gemeente_namen = sorted([
-            f["properties"].get("statnaam") or f["properties"].get("name","")
-            for f in gemeente_geojson["features"]
-        ])
-    except Exception as e:
-        st.error(f"Kon gemeentegrenzen niet laden: {e}")
-        st.stop()
+gemeente_geojson = get_geojson(GEOJSON_GEMEENTE)
+gemeente_kerncijfers, leeftijd_col = get_gemeente_kerncijfers()
 
-gemeente_leeftijd = get_gemeente_leeftijd()
+# Voeg statcode en gem. leeftijd toe aan GeoJSON
+for feat in gemeente_geojson["features"]:
+    props = feat["properties"]
+    # statcode in GeoJSON is bijv. "GM0363"
+    statcode = props.get("statcode","")
+    naam     = props.get("statnaam") or props.get("name","")
+    props["display_naam"]  = naam
+    props["gem_leeftijd"]  = gemeente_kerncijfers.get(statcode)
+    props["leeftijd_label"]= f"{gemeente_kerncijfers[statcode]:.1f} jr" if statcode in gemeente_kerncijfers else "—"
 
 # ── Zijbalk ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("🔍 Zoeken")
-    zoek_naam = st.text_input("Gemeente of postcode", placeholder="bijv. Haarlem of 2011")
+    zoek = st.text_input("Gemeente of postcode", placeholder="bijv. Amsterdam of 1013")
+
+    if zoek:
+        zoek = zoek.strip()
+        if zoek.isdigit() and len(zoek) == 4:
+            # Postcode → zoek gemeente
+            try:
+                r = requests.get(
+                    "https://api.pdok.nl/bzk/locatieserver/search/v3_1/free",
+                    params={"q": zoek, "fq": "type:postcode", "rows": 1, "fl": "gemeentenaam,centroide_ll"},
+                    timeout=5
+                )
+                if r.status_code == 200:
+                    docs = r.json().get("response",{}).get("docs",[])
+                    if docs:
+                        gem_naam = docs[0].get("gemeentenaam","")
+                        if gem_naam:
+                            st.session_state.geselecteerde_gemeente = gem_naam
+                            st.success(f"Gemeente: {gem_naam}")
+            except Exception:
+                pass
+        else:
+            st.session_state.geselecteerde_gemeente = zoek
 
     st.divider()
-    st.header("🎨 Kaart inkleuren op")
-    kleur_keuze = st.radio("", ["Gem. leeftijd", "Aandeel 65+", "Aandeel 0-25"], label_visibility="collapsed")
+    if st.session_state.geselecteerde_gemeente:
+        st.success(f"📍 {st.session_state.geselecteerde_gemeente}")
+        if st.button("✖ Selectie wissen"):
+            st.session_state.geselecteerde_gemeente = None
+            st.rerun()
 
     st.divider()
     st.caption(f"Peiljaar: {periode_title}")
-    st.caption("Klik op een gemeente op de kaart voor demografische details")
+    st.caption("Choropleth: gemiddelde leeftijd per gemeente")
+    st.caption("Klik op een gemeente voor demografische details")
 
-# ── Kaart opbouwen ─────────────────────────────────────────────────────────────
-# Voeg leeftijdsdata toe aan GeoJSON properties voor choropleth
-for feature in gemeente_geojson["features"]:
-    props = feature["properties"]
-    stat_code = props.get("statcode","")
-    gem_leeft = gemeente_leeftijd.get(stat_code)
-    props["gem_leeftijd"] = round(gem_leeft, 1) if gem_leeft else None
-    props["display_naam"] = props.get("statnaam") or props.get("name","")
-
-# Startpositie bepalen
-start_lat, start_lon, start_zoom = 52.15, 5.3, 7
-
-# Als er gezocht wordt: zoom naar gemeente
-if zoek_naam and zoek_naam.strip():
-    zoek = zoek_naam.strip()
-    if zoek.isdigit() and len(zoek) == 4:
-        # Postcode → zoom in
-        start_zoom = 12
-        try:
-            r = requests.get(
-                "https://api.pdok.nl/bzk/locatieserver/search/v3_1/free",
-                params={"q": zoek, "fq": "type:postcode", "rows": 1, "fl": "centroide_ll,woonplaatsnaam"},
-                timeout=5
-            )
-            if r.status_code == 200:
-                docs = r.json().get("response",{}).get("docs",[])
-                if docs:
-                    centroide = docs[0].get("centroide_ll","")
-                    import re
-                    m = re.search(r'POINT\(([0-9.]+)\s+([0-9.]+)\)', centroide)
-                    if m:
-                        start_lon, start_lat = float(m.group(1)), float(m.group(2))
-        except Exception:
-            pass
-    else:
-        # Gemeente naam → zoom naar gemeente
-        for feature in gemeente_geojson["features"]:
-            naam = feature["properties"].get("statnaam","") or feature["properties"].get("name","")
-            if naam.lower() == zoek.lower():
-                import json as _json
-                coords = feature["geometry"]["coordinates"]
-                all_lats = []
-                all_lons = []
-                def extract_coords(c):
-                    if isinstance(c[0], list):
-                        for sub in c: extract_coords(sub)
-                    else:
-                        all_lons.append(c[0]); all_lats.append(c[1])
-                extract_coords(coords)
-                if all_lats:
-                    start_lat = sum(all_lats)/len(all_lats)
-                    start_lon = sum(all_lons)/len(all_lons)
-                    start_zoom = 11
-                break
-
-# Bouw Folium kaart
-m = folium.Map(location=[start_lat, start_lon], zoom_start=start_zoom,
+# ── Kaart bouwen ───────────────────────────────────────────────────────────────
+m = folium.Map(location=[52.15, 5.3], zoom_start=7,
                tiles="CartoDB positron", prefer_canvas=True)
 
-# Choropleth laag op basis van gem. leeftijd
-leeftijd_values = {
-    f["properties"].get("statcode",""): f["properties"].get("gem_leeftijd")
-    for f in gemeente_geojson["features"]
-    if f["properties"].get("gem_leeftijd")
-}
-
-if leeftijd_values:
-    folium.Choropleth(
+# Choropleth — gem. leeftijd per gemeente
+if gemeente_kerncijfers:
+    choropleth = folium.Choropleth(
         geo_data=gemeente_geojson,
-        data=pd.Series(leeftijd_values),
+        data=pd.Series(gemeente_kerncijfers),
         key_on="feature.properties.statcode",
         fill_color="RdYlGn_r",
-        fill_opacity=0.7,
-        line_opacity=0.3,
+        fill_opacity=0.75,
+        line_opacity=0.2,
         line_color="white",
-        legend_name="Gemiddelde leeftijd",
-        name="Gem. leeftijd per gemeente",
-        nan_fill_color="#cccccc",
-        nan_fill_opacity=0.3,
-    ).add_to(m)
+        legend_name="Gemiddelde leeftijd (jaar)",
+        name="Gem. leeftijd",
+        nan_fill_color="#dddddd",
+        nan_fill_opacity=0.4,
+    )
+    choropleth.add_to(m)
 
-# Interactieve laag met tooltip + klik
-def style_fn(feature):
-    return {"fillOpacity": 0, "weight": 0.8, "color": "#666"}
-
-def highlight_fn(feature):
-    return {"fillOpacity": 0.3, "fillColor": "#1D9E75", "weight": 2, "color": "#1D9E75"}
-
-gemeente_layer = folium.GeoJson(
+# Klikbare transparante laag met tooltip
+folium.GeoJson(
     gemeente_geojson,
-    name="Gemeenten",
-    style_function=style_fn,
-    highlight_function=highlight_fn,
+    name="Gemeentegrenzen",
+    style_function=lambda f: {
+        "fillOpacity": 0,
+        "weight": 0.8,
+        "color": "#555",
+    },
+    highlight_function=lambda f: {
+        "fillOpacity": 0.25,
+        "fillColor": "#1D9E75",
+        "weight": 2.5,
+        "color": "#1D9E75",
+    },
     tooltip=GeoJsonTooltip(
-        fields=["display_naam", "gem_leeftijd"],
+        fields=["display_naam", "leeftijd_label"],
         aliases=["Gemeente:", "Gem. leeftijd:"],
-        style="font-size:13px; font-family:sans-serif;",
+        style="font-size:13px; font-family:sans-serif; padding:6px;",
         sticky=True,
     ),
 ).add_to(m)
 
 folium.LayerControl().add_to(m)
 
-# ── Layout: kaart links, detail rechts ────────────────────────────────────────
-col_kaart, col_detail = st.columns([3, 2])
+# ── Layout ─────────────────────────────────────────────────────────────────────
+col_kaart, col_detail = st.columns([3, 2], gap="medium")
 
 with col_kaart:
-    kaart_output = st_folium(
+    kaart_data = st_folium(
         m,
         width="100%",
-        height=600,
-        returned_objects=["last_object_clicked_tooltip", "last_active_drawing"],
-        key="hoofdkaart",
+        height=620,
+        returned_objects=["last_clicked"],
+        key="kaart",
     )
 
-# ── Detecteer aangeklikte gemeente ────────────────────────────────────────────
-geselecteerd = None
-if kaart_output and kaart_output.get("last_object_clicked_tooltip"):
-    tooltip_data = kaart_output["last_object_clicked_tooltip"]
-    if isinstance(tooltip_data, dict):
-        geselecteerd = tooltip_data.get("display_naam") or tooltip_data.get("statnaam")
-
-# Override vanuit zoekveld
-if zoek_naam and not zoek_naam.strip().isdigit():
-    geselecteerd = zoek_naam.strip()
+    # Gemeente detecteren via klik-coördinaten → reverse geocode
+    if kaart_data and kaart_data.get("last_clicked"):
+        klik = kaart_data["last_clicked"]
+        lat, lon = klik.get("lat"), klik.get("lng")
+        if lat and lon:
+            with st.spinner("Gemeente bepalen..."):
+                gevonden = gemeente_van_coordinaten(lat, lon)
+            if gevonden and gevonden != st.session_state.geselecteerde_gemeente:
+                st.session_state.geselecteerde_gemeente = gevonden
+                st.rerun()
 
 # ── Detailpaneel ───────────────────────────────────────────────────────────────
 with col_detail:
-    if not geselecteerd:
-        st.info("👈 Klik op een gemeente op de kaart, of zoek een gemeente / postcode links.")
-    else:
-        st.subheader(f"📍 {geselecteerd}")
+    gemeente = st.session_state.geselecteerde_gemeente
 
-        # Postcodes van gemeente ophalen
-        with st.spinner(f"Postcodes van {geselecteerd} laden..."):
-            gem_pcs = zoek_postcodes_van_gemeente(geselecteerd)
+    if not gemeente:
+        st.markdown("""
+        ### 👈 Hoe te gebruiken
+        1. **Klik op een gemeente** op de kaart
+        2. Of **zoek** een gemeente of postcode links
+        3. Bekijk leeftijd, huishoudens en herkomst in de tabs
+
+        De kaart is ingekleurd op **gemiddelde leeftijd** — rood = ouder, groen = jonger.
+        """)
+    else:
+        st.subheader(f"📍 {gemeente}")
+
+        with st.spinner(f"Postcodes van {gemeente} ophalen..."):
+            gem_pcs = postcodes_van_gemeente(gemeente)
 
         if not gem_pcs:
-            st.warning(f"Geen postcodes gevonden voor {geselecteerd}.")
+            st.warning(f"Geen postcodes gevonden voor {gemeente}.")
         else:
-            st.caption(f"{len(gem_pcs)} postcodes • {periode_title}")
-
-            # Postcode selectie
+            # Postcode selector
             pc_keuze = st.selectbox(
-                "Postcode selecteren (of bekijk heel de gemeente)",
+                "Detailniveau",
                 ["📊 Hele gemeente"] + gem_pcs,
-                key="pc_select"
+                key="pc_keuze",
+                help="Kies 'Hele gemeente' voor een totaalbeeld, of één postcode voor specifiek detail"
             )
 
-            toon_gemeente = pc_keuze == "📊 Hele gemeente"
-            pcs_te_laden = gem_pcs if toon_gemeente else [pc_keuze]
+            pcs_laden = gem_pcs if pc_keuze == "📊 Hele gemeente" else [pc_keuze]
+            label_titel = gemeente if pc_keuze == "📊 Hele gemeente" else f"Postcode {pc_keuze}"
 
-            # Data laden
-            with st.spinner("Data laden..."):
+            st.caption(f"{len(gem_pcs)} postcodes in {gemeente} | Toon: {label_titel}")
+
+            with st.spinner("CBS data laden..."):
+                # Leeftijd
                 verdelingen = {}
-                for pc in pcs_te_laden:
+                for pc in pcs_laden:
                     key = pc_key_map.get(pc)
                     if key:
                         v = get_leeftijd_verd(key, periode_key, geslacht_key, leeftijd_keys, leeftijd_map)
                         if v: verdelingen[pc] = v
 
+                # Huishoudens (max 30 voor snelheid)
                 hh_results = {}
-                for pc in pcs_te_laden[:20]:  # max 20 voor snelheid
+                for pc in pcs_laden[:30]:
                     key = hh_pc_map.get(pc)
                     if key:
                         d = get_hh_data(key, hh_per_key, hh_map_meta)
                         if d: hh_results[pc] = d
 
+                # Herkomst (max 30)
                 hk_results = {}
-                for pc in pcs_te_laden[:20]:
+                for pc in pcs_laden[:30]:
                     key = hk_pc_map.get(pc)
                     if key:
                         d = get_hk_data(key, hk_per_key, gb_totaal, gsl_key, hk_map_meta)
                         if d: hk_results[pc] = d
 
             if not verdelingen:
-                st.warning("Geen CBS-data beschikbaar.")
+                st.warning("Geen CBS data gevonden.")
             else:
-                # Aggregeren
-                verd_totaal = combineer(list(verdelingen.values()))
-                hh_totaal   = {}
-                for d in hh_results.values():
-                    for k,v in d.items():
-                        hh_totaal[k] = hh_totaal.get(k,0) + v
+                verd_agg = combineer(list(verdelingen.values()))
+                hh_agg   = combineer([d for d in hh_results.values()])
+                hk_agg   = combineer([d for d in hk_results.values()])
 
-                hk_totaal = {}
-                for d in hk_results.values():
-                    for k,v in d.items():
-                        hk_totaal[k] = hk_totaal.get(k,0) + v
+                tab1, tab2, tab3 = st.tabs(["👥 Leeftijd", "🏠 Huishoudens", "🌍 Herkomst"])
 
-                # Tabs
-                dt1, dt2, dt3 = st.tabs(["👥 Leeftijd", "🏠 Huishoudens", "🌍 Herkomst"])
+                with tab1:
+                    tot = sum(verd_agg.values())
+                    gem = gem_leeftijd_fn(verd_agg)
+                    oud = sum(v for k,v in verd_agg.items() if k in ["65-70","70-75","75-80","80-85","85-90","90+"])
+                    jong= sum(v for k,v in verd_agg.items() if k in ["0-5","5-10","10-15","15-20","20-25"])
 
-                with dt1:
-                    tot = sum(verd_totaal.values())
-                    gem = gem_leeftijd_verd(verd_totaal)
-                    oud = sum(v for k,v in verd_totaal.items() if k in ["65-70","70-75","75-80","80-85","85-90","90+"])
-                    jong= sum(v for k,v in verd_totaal.items() if k in ["0-5","5-10","10-15","15-20","20-25"])
+                    c1,c2 = st.columns(2)
+                    c1.metric("Inwoners",      f"{int(tot):,}".replace(",","."))
+                    c2.metric("Gem. leeftijd", f"{gem:.1f} jaar" if gem else "—")
+                    c3,c4 = st.columns(2)
+                    c3.metric("Aandeel 65+",  f"{oud/tot*100:.1f}%")
+                    c4.metric("Aandeel 0-25", f"{jong/tot*100:.1f}%")
 
-                    a, b = st.columns(2)
-                    a.metric("Inwoners", f"{int(tot):,}".replace(",","."))
-                    b.metric("Gem. leeftijd", f"{gem:.1f} jaar" if gem else "—")
-                    c, d_ = st.columns(2)
-                    c.metric("Aandeel 65+", f"{oud/tot*100:.1f}%")
-                    d_.metric("Aandeel 0-25", f"{jong/tot*100:.1f}%")
-
-                    df_plot = pd.DataFrame([
-                        {"Leeftijdsgroep": lbl, "Percentage": round(pct(verd_totaal).get(lbl,0),1)}
+                    df = pd.DataFrame([
+                        {"Leeftijdsgroep": lbl, "%": round(pct(verd_agg).get(lbl,0),1)}
                         for lbl in LABELS_VOLGORDE
                     ])
-                    fig = px.bar(df_plot, x="Leeftijdsgroep", y="Percentage",
+                    fig = px.bar(df, x="Leeftijdsgroep", y="%",
                                  color_discrete_sequence=["#1D9E75"],
-                                 labels={"Percentage":"%"}, height=260)
+                                 height=240)
                     fig.update_layout(plot_bgcolor="white", paper_bgcolor="white",
                                       xaxis=dict(tickangle=-45, tickfont=dict(size=9)),
-                                      yaxis=dict(showgrid=True, gridcolor="#eee"),
-                                      margin=dict(t=10, b=50, l=30, r=10),
+                                      yaxis=dict(showgrid=True, gridcolor="#eee", title=""),
+                                      margin=dict(t=8, b=50, l=30, r=8),
                                       showlegend=False)
                     st.plotly_chart(fig, use_container_width=True)
 
-                with dt2:
-                    if not hh_totaal:
+                with tab2:
+                    if not hh_agg:
                         st.info("Geen huishoudensdata.")
                     else:
-                        tot_hh = hh_totaal.get("__totaal", 1) or 1
-                        st.metric("Totaal huishoudens", f"{int(tot_hh):,}".replace(",","."))
-                        st.metric("Gem. grootte", f"{hh_totaal.get('__grootte',0):.1f} pers.")
-                        pie_data = {k: v for k,v in hh_totaal.items() if not k.startswith("__")}
-                        if pie_data:
-                            fig_pie = px.pie(names=list(pie_data.keys()),
-                                             values=list(pie_data.values()),
-                                             color_discrete_sequence=["#1D9E75","#185FA5","#BA7517"],
-                                             hole=0.45, height=250)
-                            fig_pie.update_layout(margin=dict(t=10,b=10,l=10,r=10),
-                                                  legend=dict(font=dict(size=11)))
-                            st.plotly_chart(fig_pie, use_container_width=True)
+                        tot_hh = hh_agg.get("__totaal",1) or 1
+                        c1,c2 = st.columns(2)
+                        c1.metric("Huishoudens", f"{int(tot_hh):,}".replace(",","."))
+                        c2.metric("Gem. grootte", f"{hh_agg.get('__grootte',0):.1f} pers.")
+                        pie = {k:v for k,v in hh_agg.items() if not k.startswith("__") and v>0}
+                        if pie:
+                            fig_p = px.pie(names=list(pie.keys()), values=list(pie.values()),
+                                           color_discrete_sequence=["#1D9E75","#185FA5","#BA7517"],
+                                           hole=0.45, height=240)
+                            fig_p.update_layout(margin=dict(t=8,b=8,l=8,r=8),
+                                                legend=dict(font=dict(size=10)))
+                            st.plotly_chart(fig_p, use_container_width=True)
 
-                with dt3:
-                    if not hk_totaal:
+                with tab3:
+                    if not hk_agg:
                         st.info("Geen herkomstdata.")
                     else:
-                        tot_hk = hk_totaal.get("Totaal", 1) or 1
-                        pct_nl = hk_totaal.get("Nederland",0)/tot_hk*100
-                        st.metric("Herkomst Nederland", f"{pct_nl:.1f}%")
-                        st.metric("Herkomst buiten NL",  f"{100-pct_nl:.1f}%")
+                        tot_hk = hk_agg.get("Totaal",1) or 1
+                        pct_nl = hk_agg.get("Nederland",0)/tot_hk*100
+                        c1,c2 = st.columns(2)
+                        c1.metric("Herkomst NL",      f"{pct_nl:.1f}%")
+                        c2.metric("Herkomst buiten NL",f"{100-pct_nl:.1f}%")
                         hk_df = pd.DataFrame([
-                            {"Herkomst": cat, "Percentage": round(hk_totaal.get(cat,0)/tot_hk*100,1)}
-                            for cat in HK_CAT_ORDER if hk_totaal.get(cat,0) > 0
+                            {"Herkomst": cat, "%": round(hk_agg.get(cat,0)/tot_hk*100,1)}
+                            for cat in HK_CAT if hk_agg.get(cat,0)>0
                         ])
                         if not hk_df.empty:
-                            fig_hk = px.bar(hk_df, x="Percentage", y="Herkomst",
-                                            orientation="h",
-                                            color_discrete_sequence=["#534AB7"],
-                                            labels={"Percentage":"%"}, height=280)
-                            fig_hk.update_layout(plot_bgcolor="white", paper_bgcolor="white",
-                                                  xaxis=dict(showgrid=True, gridcolor="#eee"),
-                                                  yaxis=dict(autorange="reversed"),
-                                                  margin=dict(t=10, b=30, l=10, r=10),
-                                                  showlegend=False)
-                            st.plotly_chart(fig_hk, use_container_width=True)
+                            fig_h = px.bar(hk_df, x="%", y="Herkomst", orientation="h",
+                                           color_discrete_sequence=["#534AB7"],
+                                           height=260)
+                            fig_h.update_layout(plot_bgcolor="white", paper_bgcolor="white",
+                                                xaxis=dict(showgrid=True, gridcolor="#eee"),
+                                                yaxis=dict(autorange="reversed"),
+                                                margin=dict(t=8, b=30, l=8, r=8),
+                                                showlegend=False)
+                            st.plotly_chart(fig_h, use_container_width=True)
 
 st.divider()
-st.caption("Data: CBS StatLine (CC BY 4.0) | Grenzen: cartomap.github.io | Geodata: PDOK")
+st.caption("Data: CBS StatLine (CC BY 4.0) | Grenzen: cartomap.github.io | Geodata: PDOK Locatieserver")
